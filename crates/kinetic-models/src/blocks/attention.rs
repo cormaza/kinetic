@@ -573,7 +573,7 @@ impl Run {
     fn clip(&self, slots: std::ops::Range<usize>) -> Option<Run> {
         let start = self.slot.max(slots.start);
         let end = (self.slot + self.len).min(slots.end);
-        (start < end).then_some(Run {
+        (start < end).then(|| Run {
             slot: start,
             len: end - start,
             batch: self.batch,

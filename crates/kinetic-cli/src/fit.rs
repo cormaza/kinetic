@@ -67,8 +67,8 @@ impl Weights {
     }
 }
 
-/// What decode speed depends on here: the CUDA GPU with the most free
-/// memory, as (free bytes, bandwidth), and the RAM's measured bandwidth.
+/// What decode speed depends on here: the best usable GPU, as
+/// (free bytes, bandwidth), and the RAM's measured bandwidth.
 pub struct Speeds {
     gpu: Option<(u64, f64)>,
     cpu_bandwidth: f64,
@@ -76,7 +76,7 @@ pub struct Speeds {
 
 impl Speeds {
     pub fn measure(gpus: &[Gpu]) -> Speeds {
-        let gpu = best_cuda(gpus)
+        let gpu = best_gpu(gpus)
             .and_then(|g| Some((g.memory_free.unwrap_or(g.memory_total), g.bandwidth?)));
         Speeds {
             gpu,
@@ -101,17 +101,23 @@ impl Speeds {
     }
 }
 
-fn best_cuda(gpus: &[Gpu]) -> Option<&Gpu> {
-    gpus.iter()
-        .filter(|g| g.api == "CUDA")
+/// The GPU that `auto` prefers: the usable CUDA GPU with the most free
+/// memory, else the first usable Vulkan GPU (discrete GPUs first).
+pub fn best_gpu(gpus: &[Gpu]) -> Option<&Gpu> {
+    let usable = |api| {
+        gpus.iter()
+            .filter(move |g| g.api == api && g.problem.is_none())
+    };
+    usable("CUDA")
         .max_by_key(|g| g.memory_free.unwrap_or(g.memory_total))
+        .or_else(|| usable("Vulkan").next())
 }
 
 /// Bytes a model may take here with room left for its context, and where:
-/// the free memory of the CUDA GPU, else half the available RAM, as the
+/// the free memory of the preferred GPU, else half the available RAM, as the
 /// rest of the system needs some too.
 pub fn room(gpus: &[Gpu]) -> (u64, &'static str) {
-    match best_cuda(gpus).and_then(|g| g.memory_free) {
+    match best_gpu(gpus).map(|g| g.memory_free.unwrap_or(g.memory_total)) {
         Some(free) => (free.saturating_sub(HEADROOM), "on the GPU"),
         None => (system::machine().ram_available / 2, "in memory"),
     }
@@ -169,7 +175,7 @@ pub fn run(target: Option<&Path>) -> Result<()> {
     let machine = system::machine();
     let (gpus, _) = system::gpus();
     let speeds = Speeds::measure(&gpus);
-    let cuda = best_cuda(&gpus);
+    let gpu = best_gpu(&gpus);
 
     let mut out = std::io::stdout().lock();
     if models.is_empty() {
@@ -209,14 +215,15 @@ pub fn run(target: Option<&Path>) -> Result<()> {
         };
         writeln!(out, "{:<width$}  {line}", m.name)?;
     }
-    let gpu_note = match (cuda, speeds.gpu) {
+    let gpu_note = match (gpu, speeds.gpu) {
         (Some(g), Some((free, bw))) => format!(
-            "{} with {:.1} GiB free at {:.0} GB/s nominal",
+            "{} ({}) with {:.1} GiB free at {:.0} GB/s",
             g.name,
+            g.api,
             free as f64 / GIB,
             bw / 1e9
         ),
-        _ => "no CUDA GPU".into(),
+        _ => "no usable GPU".into(),
     };
     writeln!(out)?;
     writeln!(
@@ -277,5 +284,34 @@ mod tests {
         assert_eq!(gpu_context(9216, free, weights, cache), None);
         assert_eq!(gpu_context(32768, free, weights + cache(8000), cache), None);
         assert_eq!(gpu_context(32768, GB, weights, cache), None);
+    }
+
+    #[test]
+    fn best_gpu_and_room_use_vulkan_when_cuda_is_absent() {
+        let gpus = [
+            Gpu {
+                api: "Vulkan",
+                name: "AMD Radeon RX 9060 XT (RADV GFX1200)".into(),
+                driver: "radv, Vulkan 1.4.305".into(),
+                memory_total: 16 * GB,
+                memory_free: Some(15 * GB),
+                bandwidth: Some(280e9),
+                problem: None,
+            },
+            Gpu {
+                api: "Vulkan",
+                name: "Intel(R) Graphics (ADL-S)".into(),
+                driver: "Intel open-source Mesa driver, Vulkan 1.4.305".into(),
+                memory_total: 24 * GB,
+                memory_free: Some(20 * GB),
+                bandwidth: Some(50e9),
+                problem: None,
+            },
+        ];
+        let best = best_gpu(&gpus).expect("should select usable Vulkan GPU");
+        assert_eq!(best.name, "AMD Radeon RX 9060 XT (RADV GFX1200)");
+        let (bytes, where_) = room(&gpus);
+        assert_eq!(where_, "on the GPU");
+        assert_eq!(bytes, 15 * GB - HEADROOM);
     }
 }

@@ -247,3 +247,20 @@ fn mismatched_shapes_are_rejected() {
         assert!(matches!(result, Err(Error::Shape(_))));
     }
 }
+
+#[test]
+fn physical_device_reports_free_memory_and_bandwidth() {
+    let physical = match Instance::new().and_then(|i| i.physical_devices()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    for dev in &physical {
+        if dev.info().missing().is_none() {
+            assert!(dev.info().device_local_free_bytes.is_some());
+            let bw = dev
+                .measure_bandwidth()
+                .expect("usable Vulkan device should measure bandwidth");
+            assert!(bw > 1e9, "expected > 1 GB/s bandwidth, got {bw}");
+        }
+    }
+}

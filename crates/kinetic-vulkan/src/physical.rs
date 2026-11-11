@@ -1,10 +1,15 @@
 use std::ffi::CStr;
 use std::rc::Rc;
+use std::time::Instant;
 
 use ash::vk;
 
+use crate::commands::Commands;
+use crate::device::Device;
 use crate::error::{Check, Result};
 use crate::instance::{Instance, API_VERSION};
+use crate::kernels::Kernels;
+use crate::memory::DeviceBuffer;
 
 /// The subgroup size every kernel is written for.
 pub(crate) const SUBGROUP: u32 = 32;
@@ -84,6 +89,9 @@ pub struct DeviceInfo {
     pub driver_info: String,
     /// Size of the largest device-local memory heap.
     pub device_local_bytes: u64,
+    /// Free bytes in the largest device-local memory heap, when the driver
+    /// reports `VK_EXT_memory_budget`.
+    pub device_local_free_bytes: Option<u64>,
     /// The largest storage buffer a kernel can bind.
     pub max_buffer_bytes: u64,
     /// Seconds per timestamp tick.
@@ -213,12 +221,31 @@ impl PhysicalDevice {
         }
 
         let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
-        let device_local_bytes = heaps
+        let device_local_heap = heaps
             .iter()
-            .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-            .map(|h| h.size)
-            .max()
-            .unwrap_or(0);
+            .enumerate()
+            .filter(|(_, h)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .max_by_key(|(_, h)| h.size);
+        let device_local_bytes = device_local_heap.map_or(0, |(_, h)| h.size);
+        let device_local_free_bytes = match (
+            device_local_heap,
+            props.api_version >= vk::API_VERSION_1_1
+                && has_extension(ash::ext::memory_budget::NAME),
+        ) {
+            (Some((idx, _)), true) => {
+                let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+                let mut mem2 =
+                    vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+                // SAFETY: `raw` came from this instance and `VK_EXT_memory_budget`
+                // is advertised by the physical device.
+                unsafe {
+                    vk_instance.get_physical_device_memory_properties2(raw, &mut mem2);
+                }
+                let b = budget.heap_budget[idx];
+                (b > 0).then(|| b.saturating_sub(budget.heap_usage[idx]))
+            }
+            _ => None,
+        };
         let info = DeviceInfo {
             name: c_text(props.device_name_as_c_str()),
             kind: DeviceKind::from_raw(props.device_type),
@@ -232,6 +259,7 @@ impl PhysicalDevice {
             driver_name,
             driver_info,
             device_local_bytes,
+            device_local_free_bytes,
             max_buffer_bytes: props.limits.max_storage_buffer_range.into(),
             timestamp_period: f64::from(props.limits.timestamp_period) * 1e-9,
             features,
@@ -243,6 +271,55 @@ impl PhysicalDevice {
             memory,
             info,
         })
+    }
+
+    /// Achievable read bandwidth of device-local memory in bytes per second,
+    /// measured by running [`Kernels::read_sum`] over a buffer larger than
+    /// on-die caches.
+    pub fn measure_bandwidth(&self) -> Option<f64> {
+        if self.info.missing().is_some() {
+            return None;
+        }
+        let device = Device::new(self).ok()?;
+        let kernels = Kernels::load(&device).ok()?;
+        let bytes = (self.info.device_local_bytes / 8)
+            .clamp(16 << 20, 128 << 20)
+            .min(self.info.max_buffer_bytes) as usize
+            & !15;
+        if bytes < 16 {
+            return None;
+        }
+        let data = DeviceBuffer::<u8>::new(&device, bytes).ok()?;
+        let out = DeviceBuffer::<u32>::new(&device, 1).ok()?;
+        if self.info.features.timestamps && self.info.timestamp_period > 0.0 {
+            let mut c = Commands::new(&device).ok()?;
+            kernels.read_sum(&data, &out, &mut c).ok()?;
+            let mut spans = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let t0 = c.timestamp().ok()?;
+                kernels.read_sum(&data, &out, &mut c).ok()?;
+                let t1 = c.timestamp().ok()?;
+                spans.push((t0, t1));
+            }
+            let timings = c.submit().ok()?;
+            let best = spans
+                .into_iter()
+                .map(|(t0, t1)| timings.seconds(t0, t1))
+                .filter(|&s| s > 0.0)
+                .fold(f64::MAX, f64::min);
+            return (best < f64::MAX).then_some(bytes as f64 / best);
+        }
+        let mut c = Commands::new(&device).ok()?;
+        kernels.read_sum(&data, &out, &mut c).ok()?;
+        let graph = c.finish().ok()?;
+        graph.launch().ok()?;
+        let mut best = f64::MAX;
+        for _ in 0..4 {
+            let start = Instant::now();
+            graph.launch().ok()?;
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        (best > 0.0 && best < f64::MAX).then_some(bytes as f64 / best)
     }
 }
 

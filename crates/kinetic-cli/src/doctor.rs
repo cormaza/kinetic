@@ -140,9 +140,14 @@ fn describe(g: &Gpu) -> String {
         Some(free) => format!("{:.1} of {:.1} GiB free", gib(free), gib(g.memory_total)),
         None => format!("{:.1} GiB", gib(g.memory_total)),
     };
+    let kind = if g.api == "CUDA" {
+        "nominal"
+    } else {
+        "measured"
+    };
     let bandwidth = g
         .bandwidth
-        .map_or_else(String::new, |b| format!(", {:.0} GB/s nominal", b / 1e9));
+        .map_or_else(String::new, |b| format!(", {:.0} GB/s {kind}", b / 1e9));
     format!(
         "{} via {}: {}{bandwidth}; {}",
         g.name, g.api, memory, g.driver

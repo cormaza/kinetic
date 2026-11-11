@@ -36,6 +36,27 @@ pub fn cuda_free() -> Option<u64> {
     cuda().ok()?.iter().filter_map(|g| g.memory_free).max()
 }
 
+/// Free device-local memory of the Vulkan device at `index`, or the first
+/// usable Vulkan device when `index` is `None`.
+#[cfg(feature = "vulkan")]
+pub fn vulkan_free(index: Option<usize>) -> Option<u64> {
+    let devices = kinetic_vulkan::Instance::new()
+        .and_then(|i| i.physical_devices())
+        .ok()?;
+    let pick = match index {
+        Some(i) => devices.get(i).filter(|d| d.info().missing().is_none())?,
+        None => devices.iter().find(|d| d.info().missing().is_none())?,
+    };
+    let info = pick.info();
+    info.device_local_free_bytes
+        .or(Some(info.device_local_bytes))
+}
+
+#[cfg(not(feature = "vulkan"))]
+pub fn vulkan_free(_index: Option<usize>) -> Option<u64> {
+    None
+}
+
 #[cfg(feature = "cuda")]
 fn cuda() -> Result<Vec<Gpu>, String> {
     use kinetic_cuda::{driver_version, Context, Device};
@@ -86,8 +107,8 @@ fn vulkan() -> Result<Vec<Gpu>, String> {
                     info.driver_name, info.driver_info
                 ),
                 memory_total: info.device_local_bytes,
-                memory_free: None,
-                bandwidth: None,
+                memory_free: info.device_local_free_bytes,
+                bandwidth: d.measure_bandwidth(),
                 problem: info.missing(),
             }
         })

@@ -52,7 +52,17 @@ impl<'a> VulkanBackend<'a> {
     /// sequences of up to `context` tokens. Fails when no device is usable
     /// or the model needs something the Vulkan kernels lack.
     pub fn new(model: &'a Model<'a>, context: usize) -> Result<Self, LoadError> {
-        let gpu = VulkanModel::load(model, context)?;
+        Self::new_on(model, context, None)
+    }
+
+    /// Uploads `model` to the Vulkan device at `index`, or the first usable
+    /// one when `index` is `None`, for sequences of up to `context` tokens.
+    pub fn new_on(
+        model: &'a Model<'a>,
+        context: usize,
+        index: Option<usize>,
+    ) -> Result<Self, LoadError> {
+        let gpu = VulkanModel::load_device(model, context, index)?;
         let state = gpu.new_state().map_err(vulkan_error)?;
         // the drafter's cache shares the memory, so a full device fails here
         // and not on the first request
@@ -74,7 +84,16 @@ impl<'a> VulkanBackend<'a> {
     /// [`VulkanBackend::new`] that never drafts, so every token costs one
     /// forward pass, as benchmarks want.
     pub fn plain(model: &'a Model<'a>, context: usize) -> Result<Self, LoadError> {
-        VulkanBackend::new(model, context).map(Self::without_drafts)
+        Self::plain_on(model, context, None)
+    }
+
+    /// [`VulkanBackend::new_on`] that never drafts.
+    pub fn plain_on(
+        model: &'a Model<'a>,
+        context: usize,
+        index: Option<usize>,
+    ) -> Result<Self, LoadError> {
+        VulkanBackend::new_on(model, context, index).map(Self::without_drafts)
     }
 
     /// Turns RAD-1 off: every token costs one forward pass.

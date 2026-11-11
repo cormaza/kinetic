@@ -64,16 +64,11 @@ pub fn run(model: &Local, llama_bench: &Path, settings: &Settings, as_json: bool
 
 /// `kinetic bench --json` on the same binary, in its own process.
 fn kinetic(path: &Path, s: &Settings) -> Result<Value> {
-    let device = match s.device {
-        Device::Auto => "auto",
-        Device::Cpu => "cpu",
-        Device::Cuda => "cuda",
-        Device::Vulkan => "vulkan",
-    };
+    let device = s.device.to_string();
     let out = Command::new(std::env::current_exe()?)
         .arg("bench")
         .arg(path)
-        .args(["--json", "--device", device])
+        .args(["--json", "--device", &device])
         .args([
             "-t",
             &s.threads.to_string(),

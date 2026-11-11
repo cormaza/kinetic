@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::fit::Speeds;
+use crate::fit::{self, Speeds};
 use crate::library::{self, Local};
 use crate::system::{self, Gpu, Machine};
 use crate::{console, pull, Result};
@@ -62,7 +62,8 @@ pub fn run() -> Result<Option<PathBuf>> {
     let (gpus, _) = system::gpus();
     let speeds = Speeds::measure(&gpus);
     println!("{}", describe(&machine, &gpus));
-    let gpu_memory = gpus.iter().map(|g| g.memory_total).max().unwrap_or(0);
+    let gpu_memory =
+        fit::best_gpu(&gpus).map_or(0, |g| g.memory_free.unwrap_or(g.memory_total));
     let mut choices = choices(
         &speeds,
         gpu_memory,
@@ -125,7 +126,7 @@ pub fn run() -> Result<Option<PathBuf>> {
 
 fn describe(m: &Machine, gpus: &[Gpu]) -> String {
     let gib = |b: u64| b as f64 / GIB;
-    let gpu = match gpus.iter().max_by_key(|g| g.memory_total) {
+    let gpu = match fit::best_gpu(gpus) {
         Some(g) => match g.memory_free {
             Some(free) => format!("{} ({:.1} GiB free)", g.name, gib(free)),
             None => format!("{} ({:.1} GiB)", g.name, gib(g.memory_total)),

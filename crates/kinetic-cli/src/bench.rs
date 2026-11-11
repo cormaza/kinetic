@@ -119,10 +119,10 @@ pub fn run(
             ("CUDA", on, speeds)
         }
         #[cfg(feature = "vulkan")]
-        Some(Plain::Vulkan(plain)) => {
+        Some(Plain::Vulkan(plain, index)) => {
             let on = plain.device().to_owned();
             let drafting = || {
-                let gpu = kinetic_server::VulkanBackend::new(&model, context)?;
+                let gpu = kinetic_server::VulkanBackend::new_on(&model, context, index)?;
                 Ok(if rad1 { gpu } else { gpu.without_drafts() })
             };
             let speeds = measure(*plain, drafting, &model, &edit, tests)?;
@@ -222,7 +222,7 @@ enum Plain<'a> {
     #[cfg(feature = "cuda")]
     Cuda(Box<kinetic_server::CudaBackend<'a>>),
     #[cfg(feature = "vulkan")]
-    Vulkan(Box<kinetic_server::VulkanBackend<'a>>),
+    Vulkan(Box<kinetic_server::VulkanBackend<'a>>, Option<usize>),
     // only carries 'a in a build without GPU backends
     #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
     #[allow(dead_code)]
@@ -257,9 +257,9 @@ fn plain<'a>(
             )
         }
         #[cfg(feature = "vulkan")]
-        Device::Vulkan => Some(
-            kinetic_server::VulkanBackend::plain(model, context)
-                .map(|b| Plain::Vulkan(Box::new(b))),
+        Device::Vulkan(index) => Some(
+            kinetic_server::VulkanBackend::plain_on(model, context, index)
+                .map(|b| Plain::Vulkan(Box::new(b), index)),
         ),
         _ => None,
     }

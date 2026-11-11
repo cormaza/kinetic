@@ -24,7 +24,7 @@ pub fn receipts(
 ) -> Result<Receipts> {
     let mut device = match kind {
         Device::Cuda => ReceiptDevice::new(cuda_class(), name),
-        Device::Vulkan => ReceiptDevice::new(format!("vulkan-{name}"), name),
+        Device::Vulkan(_) => ReceiptDevice::new(format!("vulkan-{name}"), name),
         _ => ReceiptDevice::cpu(),
     };
     device.settings = settings(kind, runtime, context);
@@ -123,7 +123,7 @@ fn rerun_runtime(
     let device = device.unwrap_or(if class.starts_with("cuda") {
         Device::Cuda
     } else if class.starts_with("vulkan") {
-        Device::Vulkan
+        Device::Vulkan(None)
     } else {
         Device::Cpu
     });

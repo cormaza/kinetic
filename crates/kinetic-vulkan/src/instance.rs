@@ -44,7 +44,12 @@ impl Instance {
             .into_iter()
             .map(|pd| PhysicalDevice::query(self, pd))
             .collect::<Result<Vec<_>>>()?;
-        devices.sort_by_key(|d| d.info().kind.preference());
+        devices.sort_by_key(|d| {
+            (
+                d.info().kind.preference(),
+                std::cmp::Reverse(d.info().device_local_bytes),
+            )
+        });
         Ok(devices)
     }
 }

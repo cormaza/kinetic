@@ -44,13 +44,13 @@ impl Tech {
             Tech::Rad1 | Tech::WarmStart => true,
             Tech::ZeroWait | Tech::Convoy => matches!(device, Device::Cpu | Device::Cuda),
             Tech::Shortlist => device == Device::Cpu,
-            Tech::Torque => matches!(device, Device::Cuda | Device::Vulkan),
+            Tech::Torque => matches!(device, Device::Cuda | Device::Vulkan(_)),
         }
     }
 
     /// Whether `--off` can turn it off on `device`.
     fn switchable_on(self, device: Device) -> bool {
-        !(self == Tech::Torque && device == Device::Vulkan)
+        !(self == Tech::Torque && matches!(device, Device::Vulkan(_)))
     }
 }
 
@@ -93,7 +93,7 @@ mod tests {
             s,
             "on: RAD-1, Warm Start, Zero Wait, Convoy; off: Shortlist"
         );
-        let s = status(&[Tech::Torque], Device::Vulkan, &Tech::ALL);
+        let s = status(&[Tech::Torque], Device::Vulkan(None), &Tech::ALL);
         assert_eq!(s, "on: RAD-1, Warm Start, Torque (stays on here)");
         assert_eq!(Tech::from_str("rad-1", true), Ok(Tech::Rad1));
         assert_eq!(Tech::from_str("warm-start", true), Ok(Tech::WarmStart));

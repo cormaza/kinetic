@@ -46,7 +46,7 @@ impl Timings {
 
 impl Commands {
     pub fn new(device: &Rc<Device>) -> Result<Commands> {
-        let mut commands = Commands {
+        Ok(Commands {
             device: Rc::clone(device),
             cmd: device.begin()?,
             queries: vk::QueryPool::null(),
@@ -54,27 +54,12 @@ impl Commands {
             kernels: Vec::new(),
             buffers: Vec::new(),
             group: None,
-        };
-        if device.info().features.timestamps {
-            let info = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(MAX_TIMESTAMPS);
-            // SAFETY: `info` is valid; `Drop` destroys the pool.
-            commands.queries =
-                unsafe { device.raw.create_query_pool(&info, None) }.check("vkCreateQueryPool")?;
-            // SAFETY: `cmd` is recording and the pool belongs to its device.
-            unsafe {
-                device
-                    .raw
-                    .cmd_reset_query_pool(commands.cmd, commands.queries, 0, MAX_TIMESTAMPS)
-            };
-        }
-        Ok(commands)
+        })
     }
 
     /// Records the device time once all earlier commands are done.
     pub fn timestamp(&mut self) -> Result<Timestamp> {
-        if self.queries == vk::QueryPool::null() {
+        if !self.device.info().features.timestamps {
             return Err(Error::DeviceUnsupported(
                 "the compute queue has no timestamps".into(),
             ));
@@ -83,6 +68,20 @@ impl Commands {
             return Err(Error::Shape(format!(
                 "more than {MAX_TIMESTAMPS} timestamps in one command list"
             )));
+        }
+        if self.queries == vk::QueryPool::null() {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(MAX_TIMESTAMPS);
+            // SAFETY: `info` is valid; `Drop` destroys the pool.
+            self.queries = unsafe { self.device.raw.create_query_pool(&info, None) }
+                .check("vkCreateQueryPool")?;
+            // SAFETY: `cmd` is recording and the pool belongs to its device.
+            unsafe {
+                self.device
+                    .raw
+                    .cmd_reset_query_pool(self.cmd, self.queries, 0, MAX_TIMESTAMPS)
+            };
         }
         let index = self.timestamps;
         self.timestamps += 1;
@@ -134,6 +133,7 @@ impl Commands {
         Ok(Graph {
             device: Rc::clone(&self.device),
             cmd,
+            queries: std::mem::replace(&mut self.queries, vk::QueryPool::null()),
             _kernels: std::mem::take(&mut self.kernels),
             _buffers: std::mem::take(&mut self.buffers),
         })
@@ -255,6 +255,7 @@ impl Commands {
 pub struct Graph {
     device: Rc<Device>,
     cmd: vk::CommandBuffer,
+    queries: vk::QueryPool,
     _kernels: Vec<Rc<Kernel>>,
     _buffers: Vec<Rc<Allocation>>,
 }
@@ -270,6 +271,10 @@ impl Graph {
 impl Drop for Graph {
     fn drop(&mut self) {
         self.device.free(self.cmd);
+        // SAFETY: `self.cmd` was waited for on every `launch` and freed above.
+        unsafe {
+            self.device.raw.destroy_query_pool(self.queries, None);
+        }
     }
 }
 

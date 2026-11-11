@@ -146,11 +146,41 @@ impl<'m> VulkanModel<'m> {
     /// Uploads `model` to the first Vulkan device that can run it, for
     /// sequences of up to `context` tokens.
     pub fn load(model: &Model<'m>, context: usize) -> Result<VulkanModel<'m>, LoadError> {
-        let physical = devices()
-            .map_err(vulkan_error)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| LoadError("no Vulkan device can run models".into()))?;
+        VulkanModel::load_device(model, context, None)
+    }
+
+    /// Uploads `model` to the Vulkan device at `index` in
+    /// [`Instance::physical_devices`], or the first usable one when `index`
+    /// is `None`, for sequences of up to `context` tokens.
+    pub fn load_device(
+        model: &Model<'m>,
+        context: usize,
+        index: Option<usize>,
+    ) -> Result<VulkanModel<'m>, LoadError> {
+        let physical = match index {
+            None => devices()
+                .map_err(vulkan_error)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| LoadError("no Vulkan device can run models".into()))?,
+            Some(i) => {
+                let all = Instance::new()
+                    .and_then(|inst| inst.physical_devices())
+                    .map_err(vulkan_error)?;
+                let n = all.len();
+                let dev = all
+                    .into_iter()
+                    .nth(i)
+                    .ok_or_else(|| LoadError(format!("no Vulkan device {i} (found {n})")))?;
+                if let Some(why) = dev.info().missing() {
+                    return Err(LoadError(format!(
+                        "Vulkan device {i} ({}) {why}",
+                        dev.info().name
+                    )));
+                }
+                dev
+            }
+        };
         VulkanModel::load_on(model, context, &physical)
     }
 

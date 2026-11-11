@@ -140,7 +140,7 @@ enum Command {
         #[arg(short = 't', long, value_name = "N")]
         threads: Option<usize>,
         /// Where the model runs; auto picks the GPU when the model fits on it
-        #[arg(long, value_enum, default_value_t = Device::Auto, ignore_case = true)]
+        #[arg(long, default_value_t = Device::Auto)]
         device: Device,
         /// Also run llama.cpp's llama-bench on the same file with the same
         /// settings and print a card comparing both [default: llama-bench
@@ -202,7 +202,7 @@ enum Command {
         #[arg(short = 'm', long, value_name = "MODEL")]
         model: Option<PathBuf>,
         /// Where to rerun [default: the receipt's device]
-        #[arg(long, value_enum, ignore_case = true)]
+        #[arg(long)]
         device: Option<Device>,
         /// CPU threads [default: all]
         #[arg(short = 't', long, value_name = "N")]
@@ -300,7 +300,7 @@ struct RuntimeArgs {
     #[arg(short = 't', long, value_name = "N")]
     threads: Option<usize>,
     /// Where the model runs; auto picks the GPU when the model fits on it
-    #[arg(long, value_enum, default_value_t = Device::Auto, ignore_case = true)]
+    #[arg(long, default_value_t = Device::Auto)]
     device: Device,
     /// Most layers on the GPU; the rest run on the CPU [default: as many as fit]
     #[arg(long, value_name = "N")]
@@ -448,15 +448,47 @@ impl RopeArgs {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Device {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
     Auto,
-    #[value(alias = "none")]
     Cpu,
-    #[value(alias = "cuda0")]
     Cuda,
-    #[value(alias = "vulkan0")]
-    Vulkan,
+    Vulkan(Option<usize>),
+}
+
+impl std::fmt::Display for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Device::Auto => f.write_str("auto"),
+            Device::Cpu => f.write_str("cpu"),
+            Device::Cuda => f.write_str("cuda"),
+            Device::Vulkan(None) => f.write_str("vulkan"),
+            Device::Vulkan(Some(i)) => write!(f, "vulkan{i}"),
+        }
+    }
+}
+
+impl std::str::FromStr for Device {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "auto" => Ok(Device::Auto),
+            "cpu" | "none" => Ok(Device::Cpu),
+            "cuda" | "cuda0" => Ok(Device::Cuda),
+            "vulkan" => Ok(Device::Vulkan(None)),
+            _ if lower.starts_with("vulkan") => lower["vulkan".len()..]
+                .parse::<usize>()
+                .map(|i| Device::Vulkan(Some(i)))
+                .map_err(|_| {
+                    format!("invalid device {s:?}: expected auto, cpu, cuda, vulkan, or vulkan<N>")
+                }),
+            _ => Err(format!(
+                "invalid device {s:?}: expected auto, cpu, cuda, vulkan, or vulkan<N>"
+            )),
+        }
+    }
 }
 
 #[derive(Args)]
@@ -875,17 +907,22 @@ fn with_engine(
     )
 }
 
-/// `wanted`, or when its cache would not fit beside the model on the CUDA
+/// `wanted`, or when its cache would not fit beside the model on the
 /// GPU, the largest context that does, said in one line; otherwise layers
-/// would quietly move to the CPU.
+/// would quietly move to the CPU or allocation would fail.
 fn gpu_context(model: &Model, header: &Gguf, runtime: &RuntimeArgs, wanted: usize) -> usize {
-    let gpu = cfg!(feature = "cuda") && matches!(runtime.device, Device::Auto | Device::Cuda);
     let weights = fit::Weights::of(header);
     // experts leave the GPU by design, and --gpu-layers asked for a split
-    if !gpu || runtime.gpu_layers.is_some() || weights.has_experts() {
+    if runtime.gpu_layers.is_some() || weights.has_experts() {
         return wanted;
     }
-    let Some(free) = system::cuda_free() else {
+    let free = match runtime.device {
+        Device::Cpu => None,
+        Device::Cuda => system::cuda_free(),
+        Device::Vulkan(i) => system::vulkan_free(i),
+        Device::Auto => system::cuda_free().or_else(|| system::vulkan_free(None)),
+    };
+    let Some(free) = free else {
         return wanted;
     };
     // state_bytes counts f32; the GPU keeps attention caches in --cache-type-*
@@ -937,7 +974,8 @@ fn backend<'a>(
 ) -> Result<(Placed<'a>, Device)> {
     let picked = gpu::pick(runtime.device, |kind| match kind {
         Device::Cuda => cuda_backend(model, path, runtime, context, parallel),
-        _ => vulkan_backend(model, path, runtime, context),
+        Device::Vulkan(i) => vulkan_backend(model, path, runtime, context, i),
+        _ => None,
     })?;
     if let Some(gpu) = picked {
         return Ok(gpu);
@@ -1023,9 +1061,10 @@ fn vulkan_backend<'a>(
     path: &Path,
     runtime: &RuntimeArgs,
     context: usize,
+    index: Option<usize>,
 ) -> Option<std::result::Result<Placed<'a>, kinetic_models::LoadError>> {
     Some(
-        kinetic_server::VulkanBackend::new(model, context).map(|gpu| {
+        kinetic_server::VulkanBackend::new_on(model, context, index).map(|gpu| {
             let gpu = match runtime.is_off(Tech::Rad1) {
                 true => gpu.without_drafts(),
                 false => gpu,
@@ -1046,6 +1085,7 @@ fn vulkan_backend<'a>(
     _path: &Path,
     _runtime: &RuntimeArgs,
     _context: usize,
+    _index: Option<usize>,
 ) -> Option<std::result::Result<Placed<'a>, kinetic_models::LoadError>> {
     None
 }

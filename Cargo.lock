@@ -748,6 +748,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ctrlc",
+ "kinetic-cpu",
  "kinetic-cuda",
  "kinetic-gguf",
  "kinetic-ktc",
