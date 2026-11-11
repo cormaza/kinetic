@@ -760,10 +760,12 @@ fn verify(file: &Path) -> Result<()> {
 }
 
 fn set_threads(threads: Option<usize>) -> Result<()> {
-    if let Some(n) = threads {
-        rayon::ThreadPoolBuilder::new()
+    let n = threads.unwrap_or_else(kinetic_cpu::pool::default_threads);
+    kinetic_cpu::pool::set_threads(n);
+    if threads.is_some() || std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
-            .build_global()?;
+            .build_global();
     }
     Ok(())
 }

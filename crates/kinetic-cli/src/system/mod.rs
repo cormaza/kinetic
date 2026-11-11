@@ -24,6 +24,8 @@ pub struct Machine {
     pub os: String,
     pub cpu: String,
     pub threads: usize,
+    pub p_cores: usize,
+    pub e_cores: usize,
     /// The instruction sets Kinetic's CPU kernels need.
     pub avx2: bool,
     pub fma: bool,
@@ -36,10 +38,13 @@ pub struct Machine {
 pub fn machine() -> Machine {
     let (ram_total, ram_available) = os::memory().unwrap_or((0, 0));
     let (avx2, fma, f16c, avx_vnni) = features();
+    let topo = kinetic_cpu::pool::topology();
     Machine {
         os: os::name(),
         cpu: cpu_name().unwrap_or_else(|| std::env::consts::ARCH.to_owned()),
-        threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        threads: kinetic_cpu::pool::default_threads_for(&topo),
+        p_cores: topo.p_cores.len(),
+        e_cores: topo.e_cores.len(),
         avx2,
         fma,
         f16c,

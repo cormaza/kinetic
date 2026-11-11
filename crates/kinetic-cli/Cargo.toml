@@ -24,6 +24,7 @@ vulkan = ["kinetic-server/vulkan", "dep:kinetic-vulkan"]
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 ctrlc = "3.5.2"
+kinetic-cpu = { path = "../kinetic-cpu" }
 kinetic-cuda = { path = "../kinetic-cuda", optional = true }
 kinetic-gguf = { path = "../kinetic-gguf" }
 kinetic-ktc = { path = "../kinetic-ktc" }

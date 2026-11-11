@@ -110,9 +110,179 @@ impl<T> Parts<T> {
 // SAFETY: tasks only touch disjoint elements through it.
 unsafe impl<T: Send> Sync for Parts<T> {}
 
+static REQUESTED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the thread count [`for_each`] will spawn when the pool is first used.
+pub fn set_threads(threads: usize) {
+    REQUESTED_THREADS.store(threads.max(1), Ordering::Relaxed);
+}
+
+/// CPU core topology split into performance (P) and efficiency (E) cores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Topology {
+    pub p_cores: Vec<usize>,
+    pub e_cores: Vec<usize>,
+}
+
+impl Topology {
+    pub fn is_hybrid(&self) -> bool {
+        !self.p_cores.is_empty() && !self.e_cores.is_empty()
+    }
+}
+
+/// Parses a Linux sysfs CPU list such as `"0-7"` or `"0-3,8,10-11"`.
+pub fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (lo.trim().parse::<usize>(), hi.trim().parse::<usize>()) {
+                out.extend(lo..=hi);
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            out.push(cpu);
+        }
+    }
+    out
+}
+
+/// Detects performance and efficiency cores on this machine.
+pub fn topology() -> Topology {
+    #[cfg(target_os = "linux")]
+    if let Some(t) = linux_topology() {
+        return t;
+    }
+    let n = thread::available_parallelism().map_or(1, |n| n.get());
+    Topology {
+        p_cores: (0..n).collect(),
+        e_cores: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_topology() -> Option<Topology> {
+    if let Ok(core_str) = std::fs::read_to_string("/sys/devices/cpu_core/cpus") {
+        let p_cores = parse_cpu_list(&core_str);
+        if !p_cores.is_empty() {
+            let e_cores = std::fs::read_to_string("/sys/devices/cpu_atom/cpus")
+                .map(|s| parse_cpu_list(&s))
+                .unwrap_or_default();
+            return Some(Topology { p_cores, e_cores });
+        }
+    }
+    let online = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .map(|s| parse_cpu_list(&s))?;
+    if online.is_empty() {
+        return None;
+    }
+    let mut caps: Vec<(usize, u64)> = online
+        .iter()
+        .filter_map(|&cpu| {
+            let cap = std::fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"
+            ))
+            .or_else(|_| {
+                std::fs::read_to_string(format!(
+                    "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
+                ))
+            })
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+            Some((cpu, cap))
+        })
+        .collect();
+    if caps.len() != online.len() {
+        return None;
+    }
+    let max_cap = caps.iter().map(|&(_, c)| c).max()?;
+    let min_cap = caps.iter().map(|&(_, c)| c).min()?;
+    if min_cap * 100 >= max_cap * 85 {
+        return Some(Topology {
+            p_cores: online,
+            e_cores: Vec::new(),
+        });
+    }
+    caps.sort_by_key(|&(cpu, _)| cpu);
+    let mut p_cores = Vec::new();
+    let mut e_cores = Vec::new();
+    for (cpu, cap) in caps {
+        if cap * 100 >= max_cap * 85 {
+            p_cores.push(cpu);
+        } else {
+            e_cores.push(cpu);
+        }
+    }
+    Some(Topology { p_cores, e_cores })
+}
+
+pub fn default_threads_for(topo: &Topology) -> usize {
+    if topo.is_hybrid() {
+        topo.p_cores.len().max(1)
+    } else {
+        topo.p_cores
+            .len()
+            .max(thread::available_parallelism().map_or(1, |n| n.get()))
+    }
+}
+
+/// Default worker thread count: on hybrid CPUs (such as Intel Arrow Lake
+/// 8P+12E), uses the performance cores unless `RAYON_NUM_THREADS` is set.
+pub fn default_threads() -> usize {
+    let requested = REQUESTED_THREADS.load(Ordering::Relaxed);
+    if requested > 0 {
+        return requested;
+    }
+    if let Some(val) = std::env::var_os("RAYON_NUM_THREADS") {
+        if let Some(n) = val.to_str().and_then(|s| s.parse::<usize>().ok()) {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    default_threads_for(&topology())
+}
+
+/// Returns up to `threads` CPU IDs ordered P-cores first, then E-cores.
+pub fn preferred_cpus_for(topo: &Topology, threads: usize) -> Vec<usize> {
+    topo.p_cores
+        .iter()
+        .chain(topo.e_cores.iter())
+        .copied()
+        .take(threads)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread(cpus: &[usize]) {
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
+    }
+    let mut mask = [0u64; 16]; // 1024 bits, matching cpu_set_t
+    let mut any = false;
+    for &cpu in cpus {
+        if cpu < 1024 {
+            mask[cpu / 64] |= 1u64 << (cpu % 64);
+            any = true;
+        }
+    }
+    if any {
+        // SAFETY: `mask` is a valid 128-byte `cpu_set_t` and `pid == 0`
+        // targets the calling thread.
+        unsafe {
+            let _ = sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr());
+        }
+    }
+}
+
 fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new(rayon::current_num_threads()))
+    POOL.get_or_init(|| Pool::new(default_threads()))
 }
 
 /// The job word: epoch (32 bits), task count (16) and next task (16). One
@@ -172,10 +342,25 @@ impl Pool {
             lock: Mutex::new(()),
             wake: Condvar::new(),
         }));
+        let topo = topology();
+        let pin_cpus = topo
+            .is_hybrid()
+            .then(|| preferred_cpus_for(&topo, threads));
+        #[cfg(target_os = "linux")]
+        if let Some(cpus) = &pin_cpus {
+            pin_current_thread(cpus);
+        }
         for i in 1..threads {
+            let cpus = pin_cpus.clone();
             thread::Builder::new()
                 .name(format!("kinetic-{i}"))
-                .spawn(move || shared.work())
+                .spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(cpus) = &cpus {
+                        pin_current_thread(cpus);
+                    }
+                    shared.work()
+                })
                 .expect("spawn a pool thread");
         }
         Pool { shared, threads }
@@ -361,5 +546,27 @@ mod tests {
             thread::sleep(SPIN * 3);
         }
         assert_eq!(total.load(Ordering::Relaxed), 3 * 64);
+    }
+
+    #[test]
+    fn hybrid_topology_detects_p_and_e_cores_and_orders_p_first() {
+        assert_eq!(
+            parse_cpu_list("0-3, 8, 10-11\n"),
+            vec![0, 1, 2, 3, 8, 10, 11]
+        );
+        let topo = topology();
+        assert!(!topo.p_cores.is_empty());
+        if !topo.e_cores.is_empty() {
+            assert_eq!(default_threads_for(&topo), topo.p_cores.len());
+            let pref = preferred_cpus_for(&topo, topo.p_cores.len() + 2);
+            assert_eq!(&pref[..topo.p_cores.len()], &topo.p_cores[..]);
+            assert_eq!(&pref[topo.p_cores.len()..], &topo.e_cores[..2]);
+        }
+        #[cfg(target_os = "linux")]
+        if std::path::Path::new("/sys/devices/cpu_core/cpus").exists() {
+            assert_eq!(topo.p_cores, (0..8).collect::<Vec<_>>());
+            assert_eq!(topo.e_cores, (8..20).collect::<Vec<_>>());
+            assert_eq!(default_threads(), 8);
+        }
     }
 }

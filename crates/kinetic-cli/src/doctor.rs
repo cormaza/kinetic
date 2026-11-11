@@ -23,11 +23,16 @@ pub fn run() -> Result<()> {
     let yes = |b: bool| if b { "yes" } else { "NO" };
     writeln!(out, "Kinetic {}", env!("CARGO_PKG_VERSION"))?;
     writeln!(out, "  system   {}", m.os)?;
+    let threads_desc = if m.e_cores > 0 {
+        format!("{} threads ({}P+{}E cores)", m.threads, m.p_cores, m.e_cores)
+    } else {
+        format!("{} threads", m.threads)
+    };
     writeln!(
         out,
-        "  cpu      {}, {} threads, AVX2 {}, FMA {}, F16C {}, AVX-VNNI {}",
+        "  cpu      {}, {}, AVX2 {}, FMA {}, F16C {}, AVX-VNNI {}",
         m.cpu,
-        m.threads,
+        threads_desc,
         yes(m.avx2),
         yes(m.fma),
         yes(m.f16c),
