@@ -71,7 +71,13 @@ pub fn kernel_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8K, N>> {
 pub fn kernel32(ty: TensorType) -> Option<DotFn<Q8>> {
     #[cfg(target_arch = "x86_64")]
     if avx2::available() {
-        return avx2::kernel32(ty).or_else(|| avx2_legacy::kernel(ty));
+        return avx2::kernel32(ty).or_else(|| {
+            if avx2::vnni_available() {
+                avx2_legacy::vnni_kernel(ty)
+            } else {
+                avx2_legacy::kernel(ty)
+            }
+        });
     }
     scalar_kernel32(ty)
 }

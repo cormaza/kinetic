@@ -28,13 +28,14 @@ pub struct Machine {
     pub avx2: bool,
     pub fma: bool,
     pub f16c: bool,
+    pub avx_vnni: bool,
     pub ram_total: u64,
     pub ram_available: u64,
 }
 
 pub fn machine() -> Machine {
     let (ram_total, ram_available) = os::memory().unwrap_or((0, 0));
-    let (avx2, fma, f16c) = features();
+    let (avx2, fma, f16c, avx_vnni) = features();
     Machine {
         os: os::name(),
         cpu: cpu_name().unwrap_or_else(|| std::env::consts::ARCH.to_owned()),
@@ -42,6 +43,7 @@ pub fn machine() -> Machine {
         avx2,
         fma,
         f16c,
+        avx_vnni,
         ram_total,
         ram_available,
     }
@@ -58,17 +60,18 @@ pub fn disk_free(path: &Path) -> Option<u64> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn features() -> (bool, bool, bool) {
+fn features() -> (bool, bool, bool, bool) {
     (
         is_x86_feature_detected!("avx2"),
         is_x86_feature_detected!("fma"),
         is_x86_feature_detected!("f16c"),
+        is_x86_feature_detected!("avxvnni"),
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn features() -> (bool, bool, bool) {
-    (false, false, false)
+fn features() -> (bool, bool, bool, bool) {
+    (false, false, false, false)
 }
 
 /// The brand string the CPU reports, from cpuid leaves 0x80000002..4.

@@ -12,13 +12,20 @@
 
 use std::arch::x86_64::*;
 
-use super::avx2::{half, halves, load, load_i8, q6_high};
+use super::avx2::{dpbusd, half, halves, load, load_i8, q6_high, vnni_available};
 use super::{scales_mins, unpack32, TileKernel, Unpacked, Unpacked32, TILE_ROWS};
 use crate::q8::Q8Group;
 use crate::q8k::{Q8KGroup, GROUP};
 use kinetic_quant::{q3_k_scales, TensorType};
 
 pub fn kernel(ty: TensorType) -> Option<TileKernel<Unpacked, Q8KGroup>> {
+    if vnni_available() {
+        return vnni_kernel(ty);
+    }
+    avx2_only_kernel(ty)
+}
+
+pub fn avx2_only_kernel(ty: TensorType) -> Option<TileKernel<Unpacked, Q8KGroup>> {
     // SAFETY (each closure): only reachable after `avx2::available()`
     // confirmed the target features the implementations are compiled for.
     // The largest i16 partial sums are 8 * 2 * 15 * 127 (Q4_K), 4 * 2 * 31 *
@@ -49,6 +56,41 @@ pub fn kernel(ty: TensorType) -> Option<TileKernel<Unpacked, Q8KGroup>> {
             unpack: |row, out| unsafe { unpack_q3_k(row, out) },
             dot4: |rows, x| unsafe { tiles::<TILE_ROWS, 4, 16, 0, 2>(rows, x) },
             dot1: |row, x| unsafe { tiles::<1, 4, 16, 0, 2>([row], x)[0] },
+        }),
+        _ => None,
+    }
+}
+
+pub fn vnni_kernel(ty: TensorType) -> Option<TileKernel<Unpacked, Q8KGroup>> {
+    // SAFETY (each closure): only reachable after `avx2::vnni_available()`
+    // confirmed `avx2,fma,f16c,avxvnni`. `vpdpbusd` accumulates directly into
+    // i32 lanes without intermediate i16 overflow, so every scale group sums
+    // in one pass before scaling.
+    match ty {
+        TensorType::Q4K => Some(TileKernel {
+            unpack: |row, out| unsafe { unpack_q4_k(row, out) },
+            dot4: |rows, x| unsafe { tiles_vnni::<TILE_ROWS, 32, 32, 0>(rows, x) },
+            dot1: |row, x| unsafe { tiles_vnni::<1, 32, 32, 0>([row], x)[0] },
+        }),
+        TensorType::Q5K => Some(TileKernel {
+            unpack: |row, out| unsafe { unpack_q5_k(row, out) },
+            dot4: |rows, x| unsafe { tiles_vnni::<TILE_ROWS, 32, 32, 0>(rows, x) },
+            dot1: |row, x| unsafe { tiles_vnni::<1, 32, 32, 0>([row], x)[0] },
+        }),
+        TensorType::Q6K => Some(TileKernel {
+            unpack: |row, out| unsafe { unpack_q6_k(row, out) },
+            dot4: |rows, x| unsafe { tiles_vnni::<TILE_ROWS, 16, 0, 5>(rows, x) },
+            dot1: |row, x| unsafe { tiles_vnni::<1, 16, 0, 5>([row], x)[0] },
+        }),
+        TensorType::Q2K => Some(TileKernel {
+            unpack: |row, out| unsafe { unpack_q2_k(row, out) },
+            dot4: |rows, x| unsafe { tiles_vnni::<TILE_ROWS, 16, 16, 0>(rows, x) },
+            dot1: |row, x| unsafe { tiles_vnni::<1, 16, 16, 0>([row], x)[0] },
+        }),
+        TensorType::Q3K => Some(TileKernel {
+            unpack: |row, out| unsafe { unpack_q3_k(row, out) },
+            dot4: |rows, x| unsafe { tiles_vnni::<TILE_ROWS, 16, 0, 2>(rows, x) },
+            dot1: |row, x| unsafe { tiles_vnni::<1, 16, 0, 2>([row], x)[0] },
         }),
         _ => None,
     }
@@ -299,10 +341,10 @@ unsafe fn tiles<
 /// are stored as `q + (1 << OFFSET_SHIFT)` (Q6_K: 32, Q3_K: 4), which comes
 /// out of the integer sum. The f32 steps are exactly those of the one-row
 /// kernels.
+#[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn tile<
+unsafe fn tile_with<
     const R: usize,
-    const MADD_STEPS: usize,
     const SCALE_LEN: usize,
     const MIN_LEN: usize,
     const OFFSET_SHIFT: i32,
@@ -310,13 +352,13 @@ unsafe fn tile<
 >(
     rows: [&[Unpacked]; R],
     x: &Q8KGroup,
+    step: impl Fn(&Unpacked, &[u8], &[__m256i; 8], usize) -> __m256i,
 ) -> [[f32; GROUP]; R] {
     let blocks = x.blocks();
     for row in rows {
         assert_eq!(row.len(), blocks);
     }
     let block_bytes = 256 * 32 / V;
-    let steps = MADD_STEPS.min(SCALE_LEN / V);
     // Partial sums by block lane, as in `avx2::Chunk::fold`.
     let mut part = [[_mm256_setzero_ps(); 8]; R];
     for b in 0..blocks {
@@ -332,15 +374,7 @@ unsafe fn tile<
             for r in 0..R {
                 let u = &rows[r][b];
                 let q = &u.q[8 * V * s..][..8 * V];
-                for c in (0..8).step_by(steps) {
-                    let mut p = _mm256_maddubs_epi16(broadcast::<V>(&q[V * c..]), y[c]);
-                    for k in c + 1..c + steps {
-                        let w = broadcast::<V>(&q[V * k..]);
-                        p = _mm256_add_epi16(p, _mm256_maddubs_epi16(w, y[k]));
-                    }
-                    let scale = _mm256_set1_epi32(u.sc[(8 * V * s + V * c) / SCALE_LEN]);
-                    isum[r] = _mm256_add_epi32(isum[r], _mm256_madd_epi16(p, scale));
-                }
+                isum[r] = _mm256_add_epi32(isum[r], step(u, q, &y, s));
             }
         }
         let dx = _mm256_loadu_ps(x.d[b * GROUP..][..GROUP].as_ptr());
@@ -371,6 +405,34 @@ unsafe fn tile<
     reduce(&part)
 }
 
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tile<
+    const R: usize,
+    const MADD_STEPS: usize,
+    const SCALE_LEN: usize,
+    const MIN_LEN: usize,
+    const OFFSET_SHIFT: i32,
+    const V: usize,
+>(
+    rows: [&[Unpacked]; R],
+    x: &Q8KGroup,
+) -> [[f32; GROUP]; R] {
+    let steps = MADD_STEPS.min(SCALE_LEN / V);
+    tile_with::<R, SCALE_LEN, MIN_LEN, OFFSET_SHIFT, V>(rows, x, |u, q, y, s| {
+        let mut sum = _mm256_setzero_si256();
+        for c in (0..8).step_by(steps) {
+            let mut p = _mm256_maddubs_epi16(broadcast::<V>(&q[V * c..]), y[c]);
+            for k in c + 1..c + steps {
+                let w = broadcast::<V>(&q[V * k..]);
+                p = _mm256_add_epi16(p, _mm256_maddubs_epi16(w, y[k]));
+            }
+            let scale = _mm256_set1_epi32(u.sc[(8 * V * s + V * c) / SCALE_LEN]);
+            sum = _mm256_add_epi32(sum, _mm256_madd_epi16(p, scale));
+        }
+        sum
+    })
+}
+
 /// Adds each row's eight partial sums in the lane order of `avx2::hsum`:
 /// (0 + 4) + (2 + 6), then (1 + 5) + (3 + 7).
 #[inline]
@@ -399,6 +461,13 @@ unsafe fn pair_dot(sums: &[i16], pairs: &[i32]) -> __m256i {
 }
 
 pub fn kernel32(ty: TensorType) -> Option<TileKernel<Unpacked32, Q8Group>> {
+    if vnni_available() {
+        return vnni_kernel32(ty);
+    }
+    avx2_only_kernel32(ty)
+}
+
+pub fn avx2_only_kernel32(ty: TensorType) -> Option<TileKernel<Unpacked32, Q8Group>> {
     // Stored codes sum as i16 over 8 steps when below 16 (8 * 2 * 15 * 127)
     // and over 4 when below 32 (4 * 2 * 31 * 127).
     Some(match ty {
@@ -431,6 +500,59 @@ pub fn kernel32(ty: TensorType) -> Option<TileKernel<Unpacked32, Q8Group>> {
         },
         _ => return None,
     })
+}
+
+pub fn vnni_kernel32(ty: TensorType) -> Option<TileKernel<Unpacked32, Q8Group>> {
+    Some(match ty {
+        TensorType::Q4_0 => tile32_vnni_kernel::<8, 8, false>(|row, out| {
+            unsafe { unpack_q4_0(row, out) }
+        }),
+        TensorType::Q4_1 => tile32_vnni_kernel::<8, 0, true>(unpack32::q4_1),
+        TensorType::Q5_0 => tile32_vnni_kernel::<4, 16, false>(unpack32::q5_0),
+        TensorType::Q5_1 => tile32_vnni_kernel::<4, 0, true>(unpack32::q5_1),
+        TensorType::MXFP4 => tile32_vnni_kernel::<4, 12, false>(unpack32::mxfp4),
+        TensorType::IQ4NL => tile32_vnni_kernel::<0, 0, false>(unpack32::iq4_nl),
+        TensorType::Q8_0 => TileKernel {
+            unpack: |row, out| unsafe { unpack_q8_0(row, out) },
+            dot4: |rows, x| unsafe {
+                match x.width {
+                    GROUP => tile_q8_0_vnni::<TILE_ROWS, 4>(rows, x),
+                    4 => tile_q8_0_vnni::<TILE_ROWS, 8>(rows, x),
+                    _ => tile_q8_0_vnni::<TILE_ROWS, 16>(rows, x),
+                }
+            },
+            dot1: |row, x| unsafe {
+                match x.width {
+                    GROUP => tile_q8_0_vnni::<1, 4>([row], x)[0],
+                    4 => tile_q8_0_vnni::<1, 8>([row], x)[0],
+                    _ => tile_q8_0_vnni::<1, 16>([row], x)[0],
+                }
+            },
+        },
+        _ => return None,
+    })
+}
+
+fn tile32_vnni_kernel<const STEPS: usize, const OFFSET: i32, const MIN: bool>(
+    unpack: fn(&[u8], &mut [Unpacked32]),
+) -> TileKernel<Unpacked32, Q8Group> {
+    TileKernel {
+        unpack,
+        dot4: |rows, x| unsafe {
+            match x.width {
+                GROUP => tile32_vnni::<TILE_ROWS, STEPS, OFFSET, MIN, 4>(rows, x),
+                4 => tile32_vnni::<TILE_ROWS, STEPS, OFFSET, MIN, 8>(rows, x),
+                _ => tile32_vnni::<TILE_ROWS, STEPS, OFFSET, MIN, 16>(rows, x),
+            }
+        },
+        dot1: |row, x| unsafe {
+            match x.width {
+                GROUP => tile32_vnni::<1, STEPS, OFFSET, MIN, 4>([row], x)[0],
+                4 => tile32_vnni::<1, STEPS, OFFSET, MIN, 8>([row], x)[0],
+                _ => tile32_vnni::<1, STEPS, OFFSET, MIN, 16>([row], x)[0],
+            }
+        },
+    }
 }
 
 /// The [`tile32`] kernels with these parameters.
@@ -483,17 +605,18 @@ unsafe fn unpack_q4_0(row: &[u8], out: &mut [Unpacked32]) {
 /// [`tile32`] for Q8_0, whose signed weights sit in `q`: the sign moves
 /// onto the activations as in `avx2::signed_dot`, so one `maddubs` takes
 /// four weights of all eight tokens.
+#[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn tile_q8_0<const R: usize, const V: usize>(
+unsafe fn tile_q8_0_with<const R: usize, const V: usize>(
     rows: [&[Unpacked32]; R],
     x: &Q8Group,
+    dot: impl Fn(__m256i, __m256i, __m256i) -> __m256i,
 ) -> [[f32; GROUP]; R] {
     let blocks = x.blocks();
     for row in rows {
         assert_eq!(row.len(), blocks);
     }
     let width = 32 / V;
-    let ones = _mm256_set1_epi16(1);
     let mut part = [[_mm256_setzero_ps(); 8]; R];
     for b in 0..blocks {
         let qs = &x.qs[b * 32 * width..][..32 * width];
@@ -510,8 +633,7 @@ unsafe fn tile_q8_0<const R: usize, const V: usize>(
             let mut isum = _mm256_setzero_si256();
             for (k, y) in y[..width].iter().enumerate() {
                 let w = broadcast::<V>(&u.q[V * k..]);
-                let p = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(*y, w));
-                isum = _mm256_add_epi32(isum, _mm256_madd_epi16(p, ones));
+                isum = dot(isum, w, *y);
             }
             let isum = token_sums::<V>(isum);
             let dd = _mm256_mul_ps(dx, _mm256_set1_ps(u.d));
@@ -522,18 +644,21 @@ unsafe fn tile_q8_0<const R: usize, const V: usize>(
     reduce(&part)
 }
 
-/// `R` rows of a 32-value format times the eight tokens of `x`, with the
-/// f32 steps of the one-row kernels: those of `avx2::Chunk::fold` for
-/// blocks without mins, plus `(dx * m) * sum(y)` for the offset `m` of
-/// Q4_1 and Q5_1 (`MIN`).
-///
-/// With `STEPS` > 0 the weights are unsigned codes, `OFFSET` above the
-/// value, and `STEPS` four-value `maddubs` are summed as i16 per `madd`.
-/// Otherwise (IQ4_NL) they are too wide for that, and `maddubs` would
-/// also need their signs moved onto the activations, so they multiply as
-/// i16 pairs, one `madd` per two values of all eight tokens.
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn tile32<
+unsafe fn tile_q8_0<const R: usize, const V: usize>(
+    rows: [&[Unpacked32]; R],
+    x: &Q8Group,
+) -> [[f32; GROUP]; R] {
+    let ones = _mm256_set1_epi16(1);
+    tile_q8_0_with::<R, V>(rows, x, |isum, w, y| {
+        let p = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(y, w));
+        _mm256_add_epi32(isum, _mm256_madd_epi16(p, ones))
+    })
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tile32_with<
     const R: usize,
     const STEPS: usize,
     const OFFSET: i32,
@@ -542,14 +667,13 @@ unsafe fn tile32<
 >(
     rows: [&[Unpacked32]; R],
     x: &Q8Group,
+    step_u8: impl Fn(&[__m256i], &[u8]) -> __m256i,
 ) -> [[f32; GROUP]; R] {
     let blocks = x.blocks();
     for row in rows {
         assert_eq!(row.len(), blocks);
     }
     let width = 32 / V;
-    let steps = STEPS.min(width);
-    let ones = _mm256_set1_epi16(1);
     let mut part = [[_mm256_setzero_ps(); 8]; R];
     for b in 0..blocks {
         let qs = &x.qs[b * 32 * width..][..32 * width];
@@ -562,18 +686,7 @@ unsafe fn tile32<
         for r in 0..R {
             let u = &rows[r][b];
             let isum = if STEPS > 0 {
-                let mut acc = _mm256_setzero_si256();
-                for (ys, qs) in y[..width]
-                    .chunks_exact(steps)
-                    .zip(u.q.chunks_exact(V * steps))
-                {
-                    let mut p = _mm256_setzero_si256();
-                    for (&y, q) in ys.iter().zip(qs.chunks_exact(V)) {
-                        p = _mm256_add_epi16(p, _mm256_maddubs_epi16(broadcast::<V>(q), y));
-                    }
-                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
-                }
-                let acc = token_sums::<V>(acc);
+                let acc = token_sums::<V>(step_u8(&y[..width], &u.q));
                 let offset = _mm256_mullo_epi32(sums, _mm256_set1_epi32(OFFSET));
                 _mm256_sub_epi32(acc, offset)
             } else {
@@ -595,4 +708,104 @@ unsafe fn tile32<
         }
     }
     reduce(&part)
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tile32<
+    const R: usize,
+    const STEPS: usize,
+    const OFFSET: i32,
+    const MIN: bool,
+    const V: usize,
+>(
+    rows: [&[Unpacked32]; R],
+    x: &Q8Group,
+) -> [[f32; GROUP]; R] {
+    let steps = STEPS.min(32 / V);
+    let ones = _mm256_set1_epi16(1);
+    tile32_with::<R, STEPS, OFFSET, MIN, V>(rows, x, |y, q| {
+        let mut acc = _mm256_setzero_si256();
+        for (ys, qs) in y.chunks_exact(steps).zip(q.chunks_exact(V * steps)) {
+            let mut p = _mm256_setzero_si256();
+            for (&y, q) in ys.iter().zip(qs.chunks_exact(V)) {
+                p = _mm256_add_epi16(p, _mm256_maddubs_epi16(broadcast::<V>(q), y));
+            }
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones));
+        }
+        acc
+    })
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn tiles_vnni<
+    const R: usize,
+    const SCALE_LEN: usize,
+    const MIN_LEN: usize,
+    const OFFSET_SHIFT: i32,
+>(
+    rows: [&[Unpacked]; R],
+    x: &Q8KGroup,
+) -> [[f32; GROUP]; R] {
+    match x.width {
+        GROUP => tile_vnni::<R, SCALE_LEN, MIN_LEN, OFFSET_SHIFT, 4>(rows, x),
+        4 => tile_vnni::<R, SCALE_LEN, MIN_LEN, OFFSET_SHIFT, 8>(rows, x),
+        _ => tile_vnni::<R, SCALE_LEN, MIN_LEN, OFFSET_SHIFT, 16>(rows, x),
+    }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn tile_vnni<
+    const R: usize,
+    const SCALE_LEN: usize,
+    const MIN_LEN: usize,
+    const OFFSET_SHIFT: i32,
+    const V: usize,
+>(
+    rows: [&[Unpacked]; R],
+    x: &Q8KGroup,
+) -> [[f32; GROUP]; R] {
+    let steps = (SCALE_LEN / V).min(8);
+    tile_with::<R, SCALE_LEN, MIN_LEN, OFFSET_SHIFT, V>(rows, x, |u, q, y, s| {
+        let mut sum = _mm256_setzero_si256();
+        for c in (0..8).step_by(steps) {
+            let mut p = _mm256_setzero_si256();
+            for k in c..c + steps {
+                p = dpbusd(p, broadcast::<V>(&q[V * k..]), y[k]);
+            }
+            let scale = _mm256_set1_epi32(u.sc[(8 * V * s + V * c) / SCALE_LEN] as i16 as i32);
+            sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(p, scale));
+        }
+        sum
+    })
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn tile_q8_0_vnni<const R: usize, const V: usize>(
+    rows: [&[Unpacked32]; R],
+    x: &Q8Group,
+) -> [[f32; GROUP]; R] {
+    tile_q8_0_with::<R, V>(rows, x, |isum, w, y| {
+        dpbusd(isum, _mm256_abs_epi8(w), _mm256_sign_epi8(y, w))
+    })
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn tile32_vnni<
+    const R: usize,
+    const STEPS: usize,
+    const OFFSET: i32,
+    const MIN: bool,
+    const V: usize,
+>(
+    rows: [&[Unpacked32]; R],
+    x: &Q8Group,
+) -> [[f32; GROUP]; R] {
+    tile32_with::<R, STEPS, OFFSET, MIN, V>(rows, x, |y, q| {
+        let mut acc = _mm256_setzero_si256();
+        for (&y, q) in y.iter().zip(q.chunks_exact(V)) {
+            acc = dpbusd(acc, broadcast::<V>(q), y);
+        }
+        acc
+    })
 }

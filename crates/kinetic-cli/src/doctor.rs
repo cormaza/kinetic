@@ -25,12 +25,13 @@ pub fn run() -> Result<()> {
     writeln!(out, "  system   {}", m.os)?;
     writeln!(
         out,
-        "  cpu      {}, {} threads, AVX2 {}, FMA {}, F16C {}",
+        "  cpu      {}, {} threads, AVX2 {}, FMA {}, F16C {}, AVX-VNNI {}",
         m.cpu,
         m.threads,
         yes(m.avx2),
         yes(m.fma),
-        yes(m.f16c)
+        yes(m.f16c),
+        yes(m.avx_vnni)
     )?;
     writeln!(
         out,

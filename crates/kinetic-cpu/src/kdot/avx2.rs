@@ -11,7 +11,18 @@ pub fn available() -> bool {
         && is_x86_feature_detected!("f16c")
 }
 
+pub fn vnni_available() -> bool {
+    available() && is_x86_feature_detected!("avxvnni")
+}
+
 pub fn kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
+    if vnni_available() {
+        return vnni_kernel(ty);
+    }
+    avx2_only_kernel(ty)
+}
+
+pub fn avx2_only_kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
     match ty {
         TensorType::Q4K => Some(q4_k),
         TensorType::Q5K => Some(q5_k),
@@ -20,8 +31,25 @@ pub fn kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
     }
 }
 
+pub fn vnni_kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
+    match ty {
+        TensorType::Q4K => Some(q4_k_vnni),
+        TensorType::Q5K => Some(q5_k_vnni),
+        TensorType::Q6K => Some(q6_k_vnni),
+        _ => None,
+    }
+}
+
 /// The kernel for `ty` over `N` activation vectors at once.
 pub fn kernel_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8K, N>> {
+    if vnni_available() {
+        return match ty {
+            TensorType::Q4K => Some(|row, xs| unsafe { q4_k_vnni_impl::<N>(row, xs) }),
+            TensorType::Q5K => Some(|row, xs| unsafe { q5_k_vnni_impl::<N>(row, xs) }),
+            TensorType::Q6K => Some(|row, xs| unsafe { q6_k_vnni_impl::<N>(row, xs) }),
+            _ => None,
+        };
+    }
     // SAFETY (each closure): only reachable after `available()` confirmed
     // the target features the implementations are compiled for.
     match ty {
@@ -33,6 +61,13 @@ pub fn kernel_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8K, N>> {
 }
 
 pub fn kernel32(ty: TensorType) -> Option<DotFn<Q8>> {
+    if vnni_available() {
+        return vnni_kernel32(ty);
+    }
+    avx2_only_kernel32(ty)
+}
+
+pub fn avx2_only_kernel32(ty: TensorType) -> Option<DotFn<Q8>> {
     match ty {
         TensorType::Q8_0 => Some(q8_0),
         TensorType::Q4_0 => Some(q4_0),
@@ -40,8 +75,23 @@ pub fn kernel32(ty: TensorType) -> Option<DotFn<Q8>> {
     }
 }
 
+pub fn vnni_kernel32(ty: TensorType) -> Option<DotFn<Q8>> {
+    match ty {
+        TensorType::Q8_0 => Some(q8_0_vnni),
+        TensorType::Q4_0 => Some(q4_0_vnni),
+        _ => None,
+    }
+}
+
 /// The kernel for a 32-value format `ty` over `N` activation vectors.
 pub fn kernel32_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8, N>> {
+    if vnni_available() {
+        return match ty {
+            TensorType::Q8_0 => Some(|row, xs| unsafe { q8_0_vnni_impl::<N>(row, xs) }),
+            TensorType::Q4_0 => Some(|row, xs| unsafe { q4_0_vnni_impl::<N>(row, xs) }),
+            _ => None,
+        };
+    }
     // SAFETY (each closure): as in `kernel_n`.
     match ty {
         TensorType::Q8_0 => Some(|row, xs| unsafe { q8_0_impl::<N>(row, xs) }),
@@ -71,6 +121,26 @@ fn q8_0(row: &[u8], x: &Q8) -> f32 {
 
 fn q4_0(row: &[u8], x: &Q8) -> f32 {
     unsafe { q4_0_impl(row, [x])[0] }
+}
+
+fn q4_k_vnni(row: &[u8], x: &Q8K) -> f32 {
+    unsafe { q4_k_vnni_impl(row, [x])[0] }
+}
+
+fn q5_k_vnni(row: &[u8], x: &Q8K) -> f32 {
+    unsafe { q5_k_vnni_impl(row, [x])[0] }
+}
+
+fn q6_k_vnni(row: &[u8], x: &Q8K) -> f32 {
+    unsafe { q6_k_vnni_impl(row, [x])[0] }
+}
+
+fn q8_0_vnni(row: &[u8], x: &Q8) -> f32 {
+    unsafe { q8_0_vnni_impl(row, [x])[0] }
+}
+
+fn q4_0_vnni(row: &[u8], x: &Q8) -> f32 {
+    unsafe { q4_0_vnni_impl(row, [x])[0] }
 }
 
 #[inline]
@@ -454,6 +524,48 @@ pub(super) unsafe fn signed_dot(w_abs: __m256i, w: __m256i, y: __m256i) -> __m25
     )
 }
 
+/// AVX-VNNI (`{vex} vpdpbusd`) unsigned-by-signed byte dot product into i32.
+///
+/// Rust's `_mm256_dpbusd_epi32` lowers to the AVX-512VL EVEX intrinsic, which
+/// faults with SIGILL on hybrid CPUs (Alder/Raptor/Arrow Lake) that implement
+/// AVX-VNNI without AVX-512. Using `{vex} vpdpbusd` emits the 256-bit VEX
+/// encoding directly.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+pub(super) unsafe fn dpbusd(mut acc: __m256i, a: __m256i, b: __m256i) -> __m256i {
+    core::arch::asm!(
+        "{{vex}} vpdpbusd {acc:y}, {a:y}, {b:y}",
+        acc = inout(ymm_reg) acc,
+        a = in(ymm_reg) a,
+        b = in(ymm_reg) b,
+        options(pure, nomem, nostack),
+    );
+    acc
+}
+
+/// AVX-VNNI (`vpdpbusd`) signed int8 dot product: fuses unsigned-by-signed
+/// byte multiply and i32 lane accumulation into a single instruction.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+pub(super) unsafe fn signed_dot_vnni(w_abs: __m256i, w: __m256i, y: __m256i) -> __m256i {
+    dpbusd(_mm256_setzero_si256(), w_abs, _mm256_sign_epi8(y, w))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q4_k_vnni_impl<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    q4_k_impl(row, xs)
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q5_k_vnni_impl<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    q5_k_impl(row, xs)
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q6_k_vnni_impl<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    q6_k_impl(row, xs)
+}
+
 // The 32-value formats fold their blocks like the K-quants without mins,
 // block `k` into lane `k % 8`, but keep each chunk of eight blocks in
 // registers: their blocks are too short to pay for `Chunk`'s bookkeeping.
@@ -504,8 +616,13 @@ unsafe fn block_scales(chunk: &[u8], size: usize) -> __m256 {
     _mm256_cvtph_ps(_mm_loadu_si128(d.as_ptr() as *const __m128i))
 }
 
+#[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q8_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn q8_0_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, __m256i, __m256i) -> __m256i,
+) -> [f32; N] {
     let mut part = [_mm256_setzero_ps(); N];
     for (c, chunk) in row.chunks(8 * 34).enumerate() {
         let mut p = [[_mm256_setzero_si256(); 8]; N];
@@ -514,7 +631,7 @@ unsafe fn q8_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
             let w = load(&blk[2..]);
             let w_abs = _mm256_abs_epi8(w);
             for (p, x) in p.iter_mut().zip(xs) {
-                p[j] = signed_dot(w_abs, w, load_i8(&x.qs[32 * k..]));
+                p[j] = dot(w_abs, w, load_i8(&x.qs[32 * k..]));
             }
         }
         let dw = block_scales(chunk, 34);
@@ -526,9 +643,23 @@ unsafe fn q8_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
 }
 
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q4_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn q8_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q8_0_with(row, xs, |w_abs, w, y| signed_dot(w_abs, w, y))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q8_0_vnni_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q8_0_with(row, xs, |w_abs, w, y| signed_dot_vnni(w_abs, w, y))
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn q4_0_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, __m256i) -> __m256i,
+) -> [f32; N] {
     let low = _mm256_set1_epi8(0x0F);
-    let ones = _mm256_set1_epi16(1);
     let mut part = [_mm256_setzero_ps(); N];
     for (c, chunk) in row.chunks(8 * 18).enumerate() {
         let len = chunk.len() / 18;
@@ -541,7 +672,7 @@ unsafe fn q4_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
             let w = _mm256_and_si256(_mm256_blend_epi32(q, _mm256_srli_epi16(q, 4), 0xF0), low);
             for (p, x) in p.iter_mut().zip(xs) {
                 let y = load_i8(&x.qs[32 * k..]);
-                p[j] = _mm256_madd_epi16(_mm256_maddubs_epi16(w, y), ones);
+                p[j] = dot(w, y);
             }
         }
         let dw = block_scales(chunk, 18);
@@ -555,4 +686,15 @@ unsafe fn q4_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
         }
     }
     std::array::from_fn(|i| hsum(part[i]))
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn q4_0_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    let ones = _mm256_set1_epi16(1);
+    q4_0_with(row, xs, |w, y| _mm256_madd_epi16(_mm256_maddubs_epi16(w, y), ones))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q4_0_vnni_impl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q4_0_with(row, xs, |w, y| dpbusd(_mm256_setzero_si256(), w, y))
 }

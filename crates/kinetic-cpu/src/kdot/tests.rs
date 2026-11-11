@@ -397,3 +397,84 @@ fn scales_mins_match_reference_unpacking() {
         assert_eq!((sc[j], m[j]), (s, mm), "sub-block {j}");
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn vnni_matches_avx2_bit_for_bit() {
+    assert!(
+        super::avx2::vnni_available(),
+        "expected AVX-VNNI to be detected on Intel Core Ultra 7 265K"
+    );
+    let mut rng = Lcg(42);
+    for ty in [
+        TensorType::Q4K,
+        TensorType::Q5K,
+        TensorType::Q6K,
+        TensorType::Q2K,
+        TensorType::Q3K,
+    ] {
+        let cols = row_len(ty, 5);
+        let blocks = cols / ty.block_len();
+        let row = random_row(ty, blocks, &mut rng);
+        let xs: [Q8K; 4] = std::array::from_fn(|_| {
+            Q8K::quantize(&(0..cols).map(|_| rng.f32() * 3.0).collect::<Vec<_>>())
+        });
+        let avx2_dot = super::avx2::avx2_only_kernel(ty)
+            .or_else(|| super::avx2_low_bit::avx2_only_kernel(ty))
+            .unwrap();
+        let vnni_dot = super::avx2::vnni_kernel(ty)
+            .or_else(|| super::avx2_low_bit::vnni_kernel(ty))
+            .unwrap();
+        assert_eq!(
+            vnni_dot(&row, &xs[0]).to_bits(),
+            avx2_dot(&row, &xs[0]).to_bits(),
+            "{ty} one-row vnni vs avx2"
+        );
+        let avx2_tile = super::avx2_tile::avx2_only_kernel(ty).unwrap();
+        let vnni_tile = super::avx2_tile::vnni_kernel(ty).unwrap();
+        let mut u = vec![Unpacked::ZERO; blocks];
+        (vnni_tile.unpack)(&row, &mut u);
+        let group = Q8KGroup::new(&xs);
+        assert_eq!(
+            (vnni_tile.dot1)(&u, &group).map(f32::to_bits),
+            (avx2_tile.dot1)(&u, &group).map(f32::to_bits),
+            "{ty} tile dot1 vnni vs avx2"
+        );
+    }
+    for ty in [
+        TensorType::Q8_0,
+        TensorType::Q4_0,
+        TensorType::Q4_1,
+        TensorType::Q5_0,
+        TensorType::Q5_1,
+        TensorType::MXFP4,
+    ] {
+        let cols = row_len(ty, 5);
+        let blocks = cols / ty.block_len();
+        let row = random_row(ty, blocks, &mut rng);
+        let xs: [Q8; 4] = std::array::from_fn(|_| {
+            Q8::quantize(&(0..cols).map(|_| rng.f32() * 3.0).collect::<Vec<_>>())
+        });
+        let avx2_dot = super::avx2::avx2_only_kernel32(ty)
+            .or_else(|| super::avx2_legacy::kernel(ty))
+            .unwrap();
+        let vnni_dot = super::avx2::vnni_kernel32(ty)
+            .or_else(|| super::avx2_legacy::vnni_kernel(ty))
+            .unwrap();
+        assert_eq!(
+            vnni_dot(&row, &xs[0]).to_bits(),
+            avx2_dot(&row, &xs[0]).to_bits(),
+            "{ty} one-row32 vnni vs avx2"
+        );
+        let avx2_tile = super::avx2_tile::avx2_only_kernel32(ty).unwrap();
+        let vnni_tile = super::avx2_tile::vnni_kernel32(ty).unwrap();
+        let mut u = vec![Unpacked32::ZERO; blocks];
+        (vnni_tile.unpack)(&row, &mut u);
+        let group = Q8Group::new(&xs);
+        assert_eq!(
+            (vnni_tile.dot1)(&u, &group).map(f32::to_bits),
+            (avx2_tile.dot1)(&u, &group).map(f32::to_bits),
+            "{ty} tile32 dot1 vnni vs avx2"
+        );
+    }
+}

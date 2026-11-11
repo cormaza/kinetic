@@ -3,7 +3,7 @@
 
 use std::arch::x86_64::*;
 
-use super::avx2::{hsum, lane_totals, load_i8, signed_dot};
+use super::avx2::{dpbusd, hsum, lane_totals, load_i8, signed_dot, signed_dot_vnni, vnni_available};
 use super::{DotFn, DotNFn};
 use crate::q8::Q8;
 use kinetic_quant::grids::{e8m0_half, IQ4NL_VALUES, MXFP4_VALUES};
@@ -22,7 +22,28 @@ pub fn kernel(ty: TensorType) -> Option<DotFn<Q8>> {
     })
 }
 
+pub fn vnni_kernel(ty: TensorType) -> Option<DotFn<Q8>> {
+    Some(match ty {
+        TensorType::Q4_1 => |row, x| unsafe { q4_1_vnni::<1>(row, [x])[0] },
+        TensorType::Q5_0 => |row, x| unsafe { q5_0_vnni::<1>(row, [x])[0] },
+        TensorType::Q5_1 => |row, x| unsafe { q5_1_vnni::<1>(row, [x])[0] },
+        TensorType::IQ4NL => |row, x| unsafe { iq4_nl_vnni::<1>(row, [x])[0] },
+        TensorType::MXFP4 => |row, x| unsafe { mxfp4_vnni::<1>(row, [x])[0] },
+        _ => return None,
+    })
+}
+
 pub fn kernel_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8, N>> {
+    if vnni_available() {
+        return Some(match ty {
+            TensorType::Q4_1 => |row, xs| unsafe { q4_1_vnni::<N>(row, xs) },
+            TensorType::Q5_0 => |row, xs| unsafe { q5_0_vnni::<N>(row, xs) },
+            TensorType::Q5_1 => |row, xs| unsafe { q5_1_vnni::<N>(row, xs) },
+            TensorType::IQ4NL => |row, xs| unsafe { iq4_nl_vnni::<N>(row, xs) },
+            TensorType::MXFP4 => |row, xs| unsafe { mxfp4_vnni::<N>(row, xs) },
+            _ => return None,
+        });
+    }
     // SAFETY (each closure): as in `kernel`.
     Some(match ty {
         TensorType::Q4_1 => |row, xs| unsafe { q4_1::<N>(row, xs) },
@@ -146,11 +167,23 @@ unsafe fn unsigned_dot(w: __m256i, x: &Q8, k: usize) -> __m256i {
     )
 }
 
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn unsigned_dot_vnni(w: __m256i, x: &Q8, k: usize) -> __m256i {
+    dpbusd(_mm256_setzero_si256(), w, load_i8(&x.qs[32 * k..]))
+}
+
 /// Signed weights times one token's block `k`.
 #[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn table_dot(w: __m256i, x: &Q8, k: usize) -> __m256i {
     signed_dot(_mm256_abs_epi8(w), w, load_i8(&x.qs[32 * k..]))
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn table_dot_vnni(w: __m256i, x: &Q8, k: usize) -> __m256i {
+    signed_dot_vnni(_mm256_abs_epi8(w), w, load_i8(&x.qs[32 * k..]))
 }
 
 /// A sixteen-entry i8 table in both halves, for `shuffle_epi8` lookups.
@@ -160,8 +193,13 @@ unsafe fn table(values: &[i8; 16]) -> __m256i {
     _mm256_broadcastsi128_si256(_mm_loadu_si128(values.as_ptr() as *const __m128i))
 }
 
+#[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q4_1<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn q4_1_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, &Q8, usize) -> __m256i,
+) -> [f32; N] {
     walk::<N, true, _>(
         row,
         xs,
@@ -171,12 +209,27 @@ unsafe fn q4_1<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
             m: halves_at(c, 20, 2),
         },
         |b| nibbles(&b[4..]),
-        |w, x, k| unsigned_dot(w, x, k),
+        dot,
     )
 }
 
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q5_1<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn q4_1<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q4_1_with(row, xs, |w, x, k| unsigned_dot(w, x, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q4_1_vnni<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q4_1_with(row, xs, |w, x, k| unsigned_dot_vnni(w, x, k))
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn q5_1_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, &Q8, usize) -> __m256i,
+) -> [f32; N] {
     walk::<N, true, _>(
         row,
         xs,
@@ -186,13 +239,28 @@ unsafe fn q5_1<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
             m: halves_at(c, 24, 2),
         },
         |b| _mm256_or_si256(nibbles(&b[8..]), fifth_bits(&b[4..8])),
-        |w, x, k| unsigned_dot(w, x, k),
+        dot,
     )
 }
 
-// Q5_0 stores q + 16; the 16 leaves through the block sum, in lane 0.
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn q5_0<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn q5_1<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q5_1_with(row, xs, |w, x, k| unsigned_dot(w, x, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q5_1_vnni<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q5_1_with(row, xs, |w, x, k| unsigned_dot_vnni(w, x, k))
+}
+
+// Q5_0 stores q + 16; the 16 leaves through the block sum, in lane 0.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn q5_0_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, &Q8, usize) -> __m256i,
+) -> [f32; N] {
     walk::<N, false, _>(
         row,
         xs,
@@ -204,13 +272,28 @@ unsafe fn q5_0<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
         |b| _mm256_or_si256(nibbles(&b[6..]), fifth_bits(&b[2..6])),
         |w, x, k| {
             let offset = _mm256_setr_epi32(16 * x.sums[k] as i32, 0, 0, 0, 0, 0, 0, 0);
-            _mm256_sub_epi32(unsigned_dot(w, x, k), offset)
+            _mm256_sub_epi32(dot(w, x, k), offset)
         },
     )
 }
 
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn iq4_nl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn q5_0<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q5_0_with(row, xs, |w, x, k| unsigned_dot(w, x, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q5_0_vnni<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    q5_0_with(row, xs, |w, x, k| unsigned_dot_vnni(w, x, k))
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn iq4_nl_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, &Q8, usize) -> __m256i,
+) -> [f32; N] {
     let values = table(&IQ4NL_VALUES);
     walk::<N, false, _>(
         row,
@@ -221,12 +304,27 @@ unsafe fn iq4_nl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
             m: _mm256_setzero_ps(),
         },
         |b| _mm256_shuffle_epi8(values, nibbles(&b[2..])),
-        |w, x, k| table_dot(w, x, k),
+        dot,
     )
 }
 
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn mxfp4<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+unsafe fn iq4_nl<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    iq4_nl_with(row, xs, |w, x, k| table_dot(w, x, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn iq4_nl_vnni<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    iq4_nl_with(row, xs, |w, x, k| table_dot_vnni(w, x, k))
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn mxfp4_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8; N],
+    dot: impl Fn(__m256i, &Q8, usize) -> __m256i,
+) -> [f32; N] {
     let values = table(&MXFP4_VALUES);
     walk::<N, false, _>(
         row,
@@ -243,6 +341,16 @@ unsafe fn mxfp4<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
             }
         },
         |b| _mm256_shuffle_epi8(values, nibbles(&b[1..])),
-        |w, x, k| table_dot(w, x, k),
+        dot,
     )
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn mxfp4<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    mxfp4_with(row, xs, |w, x, k| table_dot(w, x, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn mxfp4_vnni<const N: usize>(row: &[u8], xs: [&Q8; N]) -> [f32; N] {
+    mxfp4_with(row, xs, |w, x, k| table_dot_vnni(w, x, k))
 }

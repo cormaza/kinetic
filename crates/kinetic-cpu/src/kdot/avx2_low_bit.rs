@@ -4,12 +4,21 @@
 
 use std::arch::x86_64::*;
 
-use super::avx2::{half, halves, hsum, load, load_i8, pair_scale, Chunk, CHUNK};
+use super::avx2::{
+    dpbusd, half, halves, hsum, load, load_i8, pair_scale, vnni_available, Chunk, CHUNK,
+};
 use super::{DotFn, DotNFn};
 use crate::q8k::Q8K;
 use kinetic_quant::{q3_k_scales, trit, TensorType};
 
 pub fn kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
+    if vnni_available() {
+        return vnni_kernel(ty);
+    }
+    avx2_only_kernel(ty)
+}
+
+pub fn avx2_only_kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
     // SAFETY (each closure): only reachable after `avx2::available()`
     // confirmed the target features the implementations are compiled for.
     Some(match ty {
@@ -21,7 +30,26 @@ pub fn kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
     })
 }
 
+pub fn vnni_kernel(ty: TensorType) -> Option<DotFn<Q8K>> {
+    Some(match ty {
+        TensorType::Q2K => |row, x| unsafe { q2_k_vnni::<1>(row, [x])[0] },
+        TensorType::Q3K => |row, x| unsafe { q3_k_vnni::<1>(row, [x])[0] },
+        TensorType::TQ1_0 => |row, x| unsafe { tq1_0_vnni::<1>(row, [x])[0] },
+        TensorType::TQ2_0 => |row, x| unsafe { tq2_0_vnni::<1>(row, [x])[0] },
+        _ => return None,
+    })
+}
+
 pub fn kernel_n<const N: usize>(ty: TensorType) -> Option<DotNFn<Q8K, N>> {
+    if vnni_available() {
+        return Some(match ty {
+            TensorType::Q2K => |row, xs| unsafe { q2_k_vnni::<N>(row, xs) },
+            TensorType::Q3K => |row, xs| unsafe { q3_k_vnni::<N>(row, xs) },
+            TensorType::TQ1_0 => |row, xs| unsafe { tq1_0_vnni::<N>(row, xs) },
+            TensorType::TQ2_0 => |row, xs| unsafe { tq2_0_vnni::<N>(row, xs) },
+            _ => return None,
+        });
+    }
     // SAFETY (each closure): as in `kernel`.
     Some(match ty {
         TensorType::Q2K => |row, xs| unsafe { q2_k::<N>(row, xs) },
@@ -201,8 +229,13 @@ unsafe fn ternary_sums<const N: usize>(u: &[__m256i; 8], xs: [&Q8K; N], k: usize
     })
 }
 
+#[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn tq2_0<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+unsafe fn tq2_0_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8K; N],
+    sums_fn: impl Fn(&[__m256i; 8], [&Q8K; N], usize) -> [__m256i; N],
+) -> [f32; N] {
     let three = _mm256_set1_epi8(3);
     walk::<N, false>(row, xs, 66, |b, k| {
         let mut u = [_mm256_setzero_si256(); 8];
@@ -216,10 +249,15 @@ unsafe fn tq2_0<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
         Sums {
             d: half(&b[64..]),
             dmin: 0.0,
-            sumi: ternary_sums(&u, xs, k),
+            sumi: sums_fn(&u, xs, k),
             mins: [_mm_setzero_si128(); N],
         }
     })
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tq2_0<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    tq2_0_with(row, xs, |u, xs, k| ternary_sums(u, xs, k))
 }
 
 /// Digit `n` of every byte of `v`, `n` given as `3^n` per i16 lane: the
@@ -240,8 +278,13 @@ unsafe fn trits(v: __m256i, pow: __m256i) -> __m256i {
 
 // TQ1_0 unpacks to t + 1 in element order (see `tq1_0_position`), then
 // shares TQ2_0's products.
+#[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn tq1_0<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+unsafe fn tq1_0_with<const N: usize>(
+    row: &[u8],
+    xs: [&Q8K; N],
+    sums_fn: impl Fn(&[__m256i; 8], [&Q8K; N], usize) -> [__m256i; N],
+) -> [f32; N] {
     const POW3: [i16; 5] = [1, 3, 9, 27, 81];
     walk::<N, false>(row, xs, 54, |b, k| {
         let mut u = [_mm256_setzero_si256(); 8];
@@ -270,8 +313,51 @@ unsafe fn tq1_0<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
         Sums {
             d: half(&b[52..]),
             dmin: 0.0,
-            sumi: ternary_sums(&u, xs, k),
+            sumi: sums_fn(&u, xs, k),
             mins: [_mm_setzero_si128(); N],
         }
     })
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn tq1_0<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    tq1_0_with(row, xs, |u, xs, k| ternary_sums(u, xs, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q2_k_vnni<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    q2_k(row, xs)
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn q3_k_vnni<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    q3_k(row, xs)
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn ternary_sums_vnni<const N: usize>(
+    u: &[__m256i; 8],
+    xs: [&Q8K; N],
+    k: usize,
+) -> [__m256i; N] {
+    let ones = _mm256_set1_epi16(1);
+    std::array::from_fn(|i| {
+        let q8 = &xs[i].qs[256 * k..];
+        let mut acc = _mm256_setzero_si256();
+        for (j, &u) in u.iter().enumerate() {
+            acc = dpbusd(acc, u, load_i8(&q8[32 * j..]));
+        }
+        _mm256_sub_epi32(acc, group_dot(ones, xs[i], k))
+    })
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn tq2_0_vnni<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    tq2_0_with(row, xs, |u, xs, k| ternary_sums_vnni(u, xs, k))
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avxvnni")]
+unsafe fn tq1_0_vnni<const N: usize>(row: &[u8], xs: [&Q8K; N]) -> [f32; N] {
+    tq1_0_with(row, xs, |u, xs, k| ternary_sums_vnni(u, xs, k))
 }
